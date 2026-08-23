@@ -1,0 +1,22 @@
+settings:
+  shutdown_timeout: 5s
+
+ticker:
+  run: |
+    i=0
+    while true; do i=$((i+1)); echo "tick $i"; sleep 1; done
+
+noisy:
+  run: |
+    while true; do
+      echo "a stdout line"
+      echo "a stderr line" >&2
+      sleep 2
+    done
+
+mortal:
+  run: |
+    echo "living briefly"
+    sleep 8
+    echo "bye"
+    exit 3
