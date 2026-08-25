@@ -39,6 +39,9 @@ Per-process fields:
 | `color` | auto-assigned | override the label color |
 | `stop_signal` | `SIGTERM` | signal sent on shutdown |
 | `stop_timeout` | `settings.shutdown_timeout` | per-process grace period |
+| `ready` | none | readiness probe (`tcp` / `http` / `log`); see `001-readiness.md` |
+| `ready_timeout` | `60s` | probe deadline |
+| `wait_for` | none | start only once the named processes are ready |
 
 `settings` is reserved; a process can't use that name. Process order in the file determines display order and color assignment, so the layout is stable across runs.
 
@@ -132,7 +135,7 @@ Internal structure:
 ## Out of scope for v1
 
 - Automatic restarts and health checks
-- Dependency ordering between processes (`depends_on`)
+- ~~Dependency ordering between processes (`depends_on`)~~ — superseded by readiness-gated `wait_for`, see `001-readiness.md`
 - Log persistence to disk
 - Search within the log pane
 - Attaching stdin to a child process

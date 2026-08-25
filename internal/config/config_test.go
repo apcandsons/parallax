@@ -93,3 +93,70 @@ func TestParseSignal(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadReadiness(t *testing.T) {
+	path := write(t, `
+iam:
+  run: echo iam
+  ready: { tcp: 127.0.0.1:17001 }
+  ready_timeout: 5s
+db:
+  run: echo db
+  ready: { log: "listening on" }
+api:
+  run: echo api
+  wait_for: [iam, db]
+web:
+  run: echo web
+  ready: { http: http://127.0.0.1:8080/healthz }
+  wait_for: [api]
+`)
+	cfg, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iam, db, api, web := cfg.Processes[0], cfg.Processes[1], cfg.Processes[2], cfg.Processes[3]
+	if iam.Ready == nil || iam.Ready.TCP != "127.0.0.1:17001" || iam.ReadyTimeout != 5*time.Second {
+		t.Errorf("iam = %+v", iam)
+	}
+	if db.Ready == nil || db.Ready.Log == nil || !db.Ready.Log.MatchString("now listening on :1") {
+		t.Errorf("db = %+v", db)
+	}
+	if db.ReadyTimeout != defaultReadyTimeout {
+		t.Errorf("db.ReadyTimeout = %v, want default", db.ReadyTimeout)
+	}
+	if api.Ready != nil || len(api.WaitFor) != 2 || api.WaitFor[0] != "iam" || api.WaitFor[1] != "db" {
+		t.Errorf("api = %+v", api)
+	}
+	if web.Ready == nil || web.Ready.HTTP == "" {
+		t.Errorf("web = %+v", web)
+	}
+
+	// Running a subset drops waits on processes that aren't part of the run.
+	sub, err := Load(path, []string{"api", "iam"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sub.Processes[1].WaitFor; len(got) != 1 || got[0] != "iam" {
+		t.Errorf("subset api.WaitFor = %v, want [iam]", got)
+	}
+}
+
+func TestLoadReadinessErrors(t *testing.T) {
+	for name, content := range map[string]string{
+		"unknown target": "a:\n  run: echo\n  wait_for: [zzz]\n",
+		"self wait":      "a:\n  run: echo\n  wait_for: [a]\n",
+		"settings wait":  "settings:\n  scrollback: 5\na:\n  run: echo\n  wait_for: [settings]\n",
+		"cycle":          "a:\n  run: echo\n  wait_for: [b]\nb:\n  run: echo\n  wait_for: [c]\nc:\n  run: echo\n  wait_for: [a]\n",
+		"empty ready":    "a:\n  run: echo\n  ready: {}\n",
+		"two probes":     "a:\n  run: echo\n  ready: { tcp: 'x:1', log: y }\n",
+		"bad regexp":     "a:\n  run: echo\n  ready: { log: '(' }\n",
+		"bad http":       "a:\n  run: echo\n  ready: { http: 'localhost:80' }\n",
+		"bad timeout":    "a:\n  run: echo\n  ready_timeout: soon\n",
+	} {
+		path := write(t, content)
+		if _, err := Load(path, nil); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+}

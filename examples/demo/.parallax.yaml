@@ -20,3 +20,17 @@ mortal:
     sleep 8
     echo "bye"
     exit 3
+
+slow-boot:
+  run: |
+    echo "compiling..."
+    sleep 3
+    echo "listening on :4321"
+    sleep 600
+  ready: { log: "listening on" }
+
+client:
+  run: |
+    echo "slow-boot is ready; doing work"
+    sleep 600
+  wait_for: [slow-boot]

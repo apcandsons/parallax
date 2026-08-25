@@ -1,6 +1,10 @@
 package proc
 
 import (
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -224,5 +228,198 @@ func TestRestart(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("output appeared %d times, want 2 (original + restart)", count)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestWaitForLogProbe(t *testing.T) {
+	m, store := newManager(t,
+		config.Process{
+			Name:         "dep",
+			Run:          `sleep 0.3; echo "listening on :1"; sleep 5`,
+			Ready:        &config.Ready{Log: regexp.MustCompile(`listening on`)},
+			ReadyTimeout: 5 * time.Second,
+		},
+		config.Process{Name: "app", Run: `echo started-app`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	defer m.ForceKillAll()
+
+	if st := m.Procs[1].Status(); !st.Waiting || st.Running {
+		t.Fatalf("app should be waiting, got %+v", st)
+	}
+	if st := m.Procs[0].Status(); !st.Running || st.Ready {
+		t.Fatalf("dep should be running but not ready, got %+v", st)
+	}
+	waitFor(t, "dep ready", func() bool { return m.Procs[0].Status().Ready })
+	st := waitExited(t, m, 1)
+	if st.ExitCode != 0 || st.WaitFailed {
+		t.Fatalf("app = %+v", st)
+	}
+	lines := store.Proc(1)
+	if !findLine(lines, logbuf.Event, "waiting for dep") || !findLine(lines, logbuf.Stdout, "started-app") {
+		t.Errorf("app lines = %+v", lines)
+	}
+	if !findLine(store.Proc(0), logbuf.Event, "ready (log") {
+		t.Error("dep should log a ready event")
+	}
+	if m.Failed() {
+		t.Error("nothing failed")
+	}
+}
+
+func TestWaitForTCPProbe(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close() // free the port; the child re-binds it
+	addr := ln.Addr().String()
+	_, port, _ := net.SplitHostPort(addr)
+
+	m, _ := newManager(t,
+		config.Process{
+			Name:         "srv",
+			Run:          `sleep 0.3; exec nc -l 127.0.0.1 ` + port,
+			Ready:        &config.Ready{TCP: addr},
+			ReadyTimeout: 5 * time.Second,
+		},
+		config.Process{Name: "app", Run: `true`, WaitFor: []string{"srv"}},
+	)
+	m.StartAll()
+	defer m.ForceKillAll()
+	waitFor(t, "srv ready", func() bool { return m.Procs[0].Status().Ready })
+	if st := waitExited(t, m, 1); st.ExitCode != 0 {
+		t.Fatalf("app = %+v", st)
+	}
+}
+
+func TestWaitForTargetExitsBeforeReady(t *testing.T) {
+	m, store := newManager(t,
+		config.Process{
+			Name:         "dep",
+			Run:          `exit 2`,
+			Ready:        &config.Ready{Log: regexp.MustCompile(`never`)},
+			ReadyTimeout: 5 * time.Second,
+		},
+		config.Process{Name: "app", Run: `echo nope`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	st := waitExited(t, m, 1)
+	if !st.WaitFailed || st.Running {
+		t.Fatalf("app = %+v", st)
+	}
+	if !findLine(store.Proc(1), logbuf.ErrEvent, "exited before becoming ready") {
+		t.Error("expected red not-started line")
+	}
+	if findLine(store.Proc(1), logbuf.Stdout, "nope") {
+		t.Error("app must not have run")
+	}
+	if !m.Failed() {
+		t.Error("wait failure should mark the run failed")
+	}
+}
+
+func TestReadyTimeoutFailsWaiters(t *testing.T) {
+	m, store := newManager(t,
+		config.Process{
+			Name:         "dep",
+			Run:          `sleep 5`,
+			Ready:        &config.Ready{Log: regexp.MustCompile(`never`)},
+			ReadyTimeout: 200 * time.Millisecond,
+		},
+		config.Process{Name: "app", Run: `true`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	defer m.ForceKillAll()
+	st := waitExited(t, m, 1)
+	if !st.WaitFailed {
+		t.Fatalf("app = %+v", st)
+	}
+	if dst := m.Procs[0].Status(); !dst.Running || !dst.ReadyFailed {
+		t.Errorf("dep should keep running with ReadyFailed, got %+v", dst)
+	}
+	if !findLine(store.Proc(0), logbuf.ErrEvent, "not ready within") {
+		t.Error("expected red timeout line on dep")
+	}
+}
+
+func TestRestartRearmsWaiters(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "ok")
+	m, store := newManager(t,
+		config.Process{
+			Name:         "dep",
+			Run:          `[ -e ` + flag + ` ] && { echo up; sleep 5; } || exit 1`,
+			Ready:        &config.Ready{Log: regexp.MustCompile(`^up$`)},
+			ReadyTimeout: 5 * time.Second,
+		},
+		config.Process{Name: "app", Run: `echo ran`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	defer m.ForceKillAll()
+	if st := waitExited(t, m, 1); !st.WaitFailed {
+		t.Fatalf("app should have wait-failed first, got %+v", st)
+	}
+
+	if err := os.WriteFile(flag, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.Restart(0)
+	waitFor(t, "app to run after re-arm", func() bool {
+		st := m.Procs[1].Status()
+		return st.Exited && !st.WaitFailed && st.ExitCode == 0
+	})
+	if !findLine(store.Proc(1), logbuf.Event, "re-armed") {
+		t.Error("expected re-armed event")
+	}
+}
+
+func TestStopCancelsWait(t *testing.T) {
+	m, store := newManager(t,
+		config.Process{Name: "dep", Run: `sleep 5`, Ready: &config.Ready{Log: regexp.MustCompile(`x`)}, ReadyTimeout: 5 * time.Second},
+		config.Process{Name: "app", Run: `true`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	defer m.ForceKillAll()
+	m.Stop(1)
+	st := m.Procs[1].Status()
+	if st.Waiting || !st.Exited || st.WaitFailed {
+		t.Fatalf("app = %+v", st)
+	}
+	if !findLine(store.Proc(1), logbuf.Event, "wait cancelled") {
+		t.Error("expected wait cancelled event")
+	}
+	if m.Failed() {
+		t.Error("user cancel is not a failure")
+	}
+}
+
+func TestShutdownReleasesWaiters(t *testing.T) {
+	m, _ := newManager(t,
+		config.Process{Name: "dep", Run: `sleep 5`, Ready: &config.Ready{Log: regexp.MustCompile(`x`)}, ReadyTimeout: 5 * time.Second},
+		config.Process{Name: "app", Run: `true`, WaitFor: []string{"dep"}},
+	)
+	m.StartAll()
+	done := make(chan struct{})
+	go func() { m.Shutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown hung")
+	}
+	if st := m.Procs[1].Status(); st.Running {
+		t.Errorf("app must not start during shutdown: %+v", st)
 	}
 }
