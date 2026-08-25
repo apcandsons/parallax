@@ -6,9 +6,12 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,10 +23,23 @@ import (
 )
 
 type Status struct {
+	Waiting  bool // start is gated on wait_for targets that aren't ready yet
 	Running  bool
 	Exited   bool
 	ExitCode int    // -1 when terminated by a signal (or never started)
 	Signal   string // signal description when terminated by one
+
+	// Ready is set once the run passed its ready probe (immediately on start
+	// for processes without one). It stays set after exit, so a one-shot
+	// task that finished cleanly still counts as ready for its waiters.
+	Ready bool
+	// ReadyFailed is set when the probe timed out; the process keeps running
+	// but its waiters are failed.
+	ReadyFailed bool
+	// WaitFailed is set when a wait_for target exited or failed its probe
+	// before becoming ready; the process was never started. Restarting the
+	// target re-arms it.
+	WaitFailed bool
 }
 
 type Proc struct {
@@ -35,6 +51,8 @@ type Proc struct {
 	st      Status
 	stopped bool          // a user-requested stop signal was sent to this run
 	done    chan struct{} // closed when the current run is reaped
+	run     uint64        // incremented per spawn; readiness events for old runs are ignored
+	waitGen uint64        // incremented per wait; cancels a superseded/aborted wait
 }
 
 func (p *Proc) Status() Status {
@@ -78,14 +96,34 @@ type Manager struct {
 	store        *logbuf.Store
 	shuttingDown atomic.Bool
 	failed       atomic.Bool
+
+	changeMu sync.Mutex
+	change   chan struct{} // closed and replaced on every status change; waiters block on it
+	byName   map[string]*Proc
 }
 
 func NewManager(cfg *config.Config, store *logbuf.Store) *Manager {
-	m := &Manager{store: store}
+	m := &Manager{store: store, change: make(chan struct{}), byName: map[string]*Proc{}}
 	for i, def := range cfg.Processes {
-		m.Procs = append(m.Procs, &Proc{Def: def, Index: i})
+		p := &Proc{Def: def, Index: i}
+		m.Procs = append(m.Procs, p)
+		m.byName[def.Name] = p
 	}
 	return m
+}
+
+// changed wakes every goroutine blocked on changeCh.
+func (m *Manager) changed() {
+	m.changeMu.Lock()
+	close(m.change)
+	m.change = make(chan struct{})
+	m.changeMu.Unlock()
+}
+
+func (m *Manager) changeCh() <-chan struct{} {
+	m.changeMu.Lock()
+	defer m.changeMu.Unlock()
+	return m.change
 }
 
 func (m *Manager) StartAll() {
@@ -94,13 +132,104 @@ func (m *Manager) StartAll() {
 	}
 }
 
+// start spawns p, or, if it has wait_for targets, parks it in the waiting
+// state until they are ready. Returns immediately either way.
+func (m *Manager) start(p *Proc) {
+	if len(p.Def.WaitFor) == 0 {
+		m.spawn(p)
+		return
+	}
+	p.mu.Lock()
+	if p.st.Running || p.st.Waiting {
+		p.mu.Unlock()
+		return
+	}
+	p.waitGen++
+	gen := p.waitGen
+	p.st = Status{Waiting: true}
+	p.mu.Unlock()
+	m.changed()
+
+	m.store.Append(p.Index, logbuf.Event, "waiting for "+strings.Join(p.Def.WaitFor, ", "))
+	go m.waitThenSpawn(p, gen)
+}
+
+func (m *Manager) waitThenSpawn(p *Proc, gen uint64) {
+	for {
+		if m.shuttingDown.Load() {
+			return
+		}
+		ch := m.changeCh() // grab before checking, so a change during the check isn't missed
+
+		p.mu.Lock()
+		cancelled := p.waitGen != gen
+		p.mu.Unlock()
+		if cancelled {
+			return
+		}
+
+		pending, failed := m.depState(p)
+		if failed != "" {
+			p.mu.Lock()
+			p.st = Status{Exited: true, ExitCode: -1, WaitFailed: true}
+			p.mu.Unlock()
+			m.failed.Store(true)
+			m.store.Append(p.Index, logbuf.ErrEvent, "not started: "+failed)
+			m.changed()
+			return
+		}
+		if pending == "" {
+			p.mu.Lock()
+			p.st = Status{}
+			p.mu.Unlock()
+			m.spawn(p)
+			return
+		}
+		<-ch
+	}
+}
+
+// depState reports the first wait_for target that isn't ready yet (pending)
+// and, if any target can no longer become ready, why (failed).
+func (m *Manager) depState(p *Proc) (pending, failed string) {
+	for _, name := range p.Def.WaitFor {
+		st := m.byName[name].Status()
+		switch {
+		case st.Ready:
+		case st.ReadyFailed:
+			return "", name + " failed its ready probe"
+		case st.Exited:
+			if st.WaitFailed {
+				return "", name + " was not started"
+			}
+			return "", name + " exited before becoming ready"
+		default:
+			if pending == "" {
+				pending = name
+			}
+		}
+	}
+	return pending, ""
+}
+
+// rearm restarts every process whose wait on target had failed. Called after
+// the user restarts target.
+func (m *Manager) rearm(target *Proc) {
+	for _, q := range m.Procs {
+		if slices.Contains(q.Def.WaitFor, target.Def.Name) && q.Status().WaitFailed {
+			m.store.Append(q.Index, logbuf.Event, "re-armed by restart of "+target.Def.Name)
+			m.start(q)
+		}
+	}
+}
+
 // Failed reports whether any process ended abnormally before shutdown was
 // initiated. Deaths caused by our own stop signals don't count.
 func (m *Manager) Failed() bool { return m.failed.Load() }
 
-func (m *Manager) start(p *Proc) {
+func (m *Manager) spawn(p *Proc) {
 	p.mu.Lock()
-	if p.st.Running {
+	if p.st.Running || p.st.Waiting {
 		p.mu.Unlock()
 		return
 	}
@@ -129,22 +258,29 @@ func (m *Manager) start(p *Proc) {
 		p.mu.Unlock()
 		m.failed.Store(true)
 		m.store.Append(p.Index, logbuf.ErrEvent, "failed to start: "+startErr.Error())
+		m.changed()
 		return
 	}
 
 	done := make(chan struct{})
 	p.cmd = cmd
-	p.st = Status{Running: true}
+	p.st = Status{Running: true, Ready: p.Def.Ready == nil}
 	p.stopped = false
 	p.done = done
+	p.run++
+	run := p.run
 	p.mu.Unlock()
+	m.changed()
 
 	m.store.Append(p.Index, logbuf.Event, fmt.Sprintf("started (pid %d)", cmd.Process.Pid))
 
 	var readers sync.WaitGroup
 	readers.Add(2)
-	go m.readPipe(p, stdout, logbuf.Stdout, &readers)
-	go m.readPipe(p, stderr, logbuf.Stderr, &readers)
+	go m.readPipe(p, run, stdout, logbuf.Stdout, &readers)
+	go m.readPipe(p, run, stderr, logbuf.Stderr, &readers)
+	if p.Def.Ready != nil {
+		go m.probe(p, run, done)
+	}
 
 	go func() {
 		// cmd.Wait closes the pipes, so it must not run until both readers
@@ -165,6 +301,8 @@ func (m *Manager) start(p *Proc) {
 		}
 
 		p.mu.Lock()
+		st.Ready = p.st.Ready
+		st.ReadyFailed = p.st.ReadyFailed
 		p.st = st
 		p.cmd = nil
 		userStopped := p.stopped
@@ -175,7 +313,85 @@ func (m *Manager) start(p *Proc) {
 		}
 		m.store.Append(p.Index, logbuf.ErrEvent, msg)
 		close(done)
+		m.changed()
 	}()
+}
+
+// markReady records that run passed its probe. Stale runs are ignored.
+func (m *Manager) markReady(p *Proc, run uint64) {
+	p.mu.Lock()
+	if p.run != run || p.st.Ready || p.st.ReadyFailed {
+		p.mu.Unlock()
+		return
+	}
+	p.st.Ready = true
+	p.mu.Unlock()
+	m.store.Append(p.Index, logbuf.Event, "ready ("+p.Def.Ready.String()+")")
+	m.changed()
+}
+
+func (m *Manager) probeDone(p *Proc, run uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.run != run || p.st.Ready || p.st.ReadyFailed || !p.st.Running
+}
+
+// probe polls a tcp/http readiness check (log probes are fed by readPipe
+// instead) until the run is ready, exits, or the ready timeout elapses.
+func (m *Manager) probe(p *Proc, run uint64, done <-chan struct{}) {
+	r := p.Def.Ready
+	timeout := time.After(p.Def.ReadyTimeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if m.probeDone(p, run) {
+			return
+		}
+		select {
+		case <-done:
+			return
+		case <-timeout:
+			p.mu.Lock()
+			if p.run != run || p.st.Ready || !p.st.Running {
+				p.mu.Unlock()
+				return
+			}
+			p.st.ReadyFailed = true
+			p.mu.Unlock()
+			m.failed.Store(true)
+			m.store.Append(p.Index, logbuf.ErrEvent,
+				fmt.Sprintf("not ready within %s (%s)", p.Def.ReadyTimeout, r.String()))
+			m.changed()
+			return
+		case <-ticker.C:
+			if r.Log == nil && checkProbe(r) {
+				m.markReady(p, run)
+				return
+			}
+		}
+	}
+}
+
+var probeClient = &http.Client{Timeout: 2 * time.Second}
+
+func checkProbe(r *config.Ready) bool {
+	switch {
+	case r.TCP != "":
+		c, err := net.DialTimeout("tcp", r.TCP, 2*time.Second)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	case r.HTTP != "":
+		resp, err := probeClient.Get(r.HTTP)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode >= 200 && resp.StatusCode < 300
+	}
+	return false
 }
 
 // Restart respawns an exited process. Running processes are left alone.
@@ -189,8 +405,13 @@ func (m *Manager) Restart(i int) {
 		m.store.Append(i, logbuf.Event, "still running; not restarted")
 		return
 	}
+	if st.Waiting {
+		m.store.Append(i, logbuf.Event, "still waiting; not restarted")
+		return
+	}
 	m.store.Append(i, logbuf.Event, "restarting")
 	m.start(p)
+	m.rearm(p)
 }
 
 // Stop sends one running process its configured stop signal. Exited processes
@@ -200,6 +421,9 @@ func (m *Manager) Stop(i int) {
 		return
 	}
 	p := m.Procs[i]
+	if m.cancelWait(p) {
+		return
+	}
 	p.mu.Lock()
 	running := p.st.Running
 	p.stopped = p.stopped || running
@@ -211,9 +435,27 @@ func (m *Manager) Stop(i int) {
 	p.signalGroup(p.Def.StopSignal)
 }
 
+// cancelWait aborts a pending wait_for wait. Reports whether p was waiting.
+func (m *Manager) cancelWait(p *Proc) bool {
+	p.mu.Lock()
+	if !p.st.Waiting {
+		p.mu.Unlock()
+		return false
+	}
+	p.waitGen++
+	p.st = Status{Exited: true, ExitCode: -1}
+	p.mu.Unlock()
+	m.store.Append(p.Index, logbuf.Event, "wait cancelled")
+	m.changed()
+	return true
+}
+
 // ForceKill SIGKILLs one running process group.
 func (m *Manager) ForceKill(i int) {
 	p := m.Procs[i]
+	if m.cancelWait(p) {
+		return
+	}
 	p.mu.Lock()
 	running := p.st.Running
 	p.stopped = p.stopped || running
@@ -232,6 +474,7 @@ func (m *Manager) Shutdown() {
 	if !m.shuttingDown.CompareAndSwap(false, true) {
 		return
 	}
+	m.changed() // release waiters
 	var wg sync.WaitGroup
 	for _, p := range m.Procs {
 		if !p.Status().Running {
@@ -260,17 +503,27 @@ func (m *Manager) Shutdown() {
 // second ctrl-c and as a safety net when the UI exits abnormally.
 func (m *Manager) ForceKillAll() {
 	m.shuttingDown.Store(true)
+	m.changed()
 	for _, p := range m.Procs {
 		p.signalGroup(syscall.SIGKILL)
 	}
 }
 
-func (m *Manager) readPipe(p *Proc, r io.Reader, kind logbuf.Kind, wg *sync.WaitGroup) {
+func (m *Manager) readPipe(p *Proc, run uint64, r io.Reader, kind logbuf.Kind, wg *sync.WaitGroup) {
 	defer wg.Done()
+	var logRE *regexp.Regexp
+	if p.Def.Ready != nil {
+		logRE = p.Def.Ready.Log
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		m.store.Append(p.Index, kind, sanitize(sc.Text()))
+		text := sanitize(sc.Text())
+		m.store.Append(p.Index, kind, text)
+		if logRE != nil && logRE.MatchString(text) {
+			m.markReady(p, run)
+			logRE = nil
+		}
 	}
 	// A partial final line (no trailing newline) is returned by Scan before
 	// EOF, so it is flushed by the loop above. Errors here are read errors,

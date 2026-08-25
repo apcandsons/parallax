@@ -321,18 +321,27 @@ func (m Model) slot(idx int, name string, st *proc.Status) string {
 	style := lipgloss.NewStyle()
 	if st != nil {
 		style = m.procStyles[idx-1]
-		if st.Exited {
-			switch {
-			case st.ExitCode == 0:
-				label += " " + "✓"
-				style = okMarkStyle
-			case st.ExitCode > 0:
-				label += fmt.Sprintf(" ✗%d", st.ExitCode)
-				style = errEventStyle
-			default:
-				label += " ✗" + strings.TrimPrefix(st.Signal, "SIG")
-				style = errEventStyle
-			}
+		switch {
+		case st.Waiting:
+			label += " ⧗" // gated on wait_for targets
+			style = okMarkStyle
+		case st.Exited && st.WaitFailed:
+			label += " ✗wait"
+			style = errEventStyle
+		case st.Exited && st.ExitCode == 0:
+			label += " ✓"
+			style = okMarkStyle
+		case st.Exited && st.ExitCode > 0:
+			label += fmt.Sprintf(" ✗%d", st.ExitCode)
+			style = errEventStyle
+		case st.Exited:
+			label += " ✗" + strings.TrimPrefix(st.Signal, "SIG")
+			style = errEventStyle
+		case st.ReadyFailed:
+			label += " ✗ready"
+			style = errEventStyle
+		case !st.Ready:
+			label += " ~" // running, probe not passed yet
 		}
 	}
 	if idx == m.selected {

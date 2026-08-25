@@ -64,8 +64,24 @@ Per-process fields:
 | `color` | auto-assigned | override the label color |
 | `stop_signal` | `SIGTERM` | signal sent on shutdown |
 | `stop_timeout` | `settings.shutdown_timeout` | per-process grace period |
+| `ready` | none | readiness probe: `{ tcp: host:port }`, `{ http: url }` (2xx), or `{ log: regexp }` (matched against the process's own output) |
+| `ready_timeout` | `60s` | how long the probe may take; on timeout the process is marked failed (red line) and its waiters fail |
+| `wait_for` | none | list of process names; start is delayed until each is ready (a process without `ready` is ready once started) |
 
 Process order in the file determines display order and color assignment, so the layout is stable across runs.
+
+Readiness gating, for a stack where one process needs another's port up before it boots:
+
+```yaml
+iam:
+  run: make -C ../gve-iam dev-pg
+  ready: { tcp: 127.0.0.1:17001 }
+dvp-api:
+  run: make -C ../gve-dvp run ENV=local-integration
+  wait_for: [iam]
+```
+
+A `wait_for` target that exits (or times out) before becoming ready fails the waiter with a red line instead of hanging; `r` on the target re-arms its waiters. Cycles and unknown names are config errors. When running a subset (`parallax api`), waits on processes outside the subset are dropped. See [doc/001-readiness.md](doc/001-readiness.md).
 
 There's a runnable example in [`examples/demo/.parallax.yaml`](examples/demo/.parallax.yaml):
 
@@ -85,7 +101,7 @@ cd examples/demo && parallax
 | `ctrl-x` | stop the selected process; press again to SIGKILL |
 | `ctrl-c` or `q` | graceful shutdown of everything |
 
-The selector bar shows liveness: running processes render in their assigned color with current memory use (RSS summed over the process group), exited ones in red with the exit code, e.g. `[2-sor ✗1]`.
+The selector bar shows liveness: running processes render in their assigned color with current memory use (RSS summed over the process group), exited ones in red with the exit code, e.g. `[2-sor ✗1]`. A process parked on `wait_for` shows `⧗`, one running but not yet past its `ready` probe shows `~`, a failed probe `✗ready`, and a waiter whose target never became ready `✗wait`.
 
 ## Behavior notes
 
@@ -93,7 +109,7 @@ Each process runs in its own process group, so stop signals reach the whole tree
 
 ANSI escape codes in child output are stripped. stderr renders the same as stdout.
 
-The full design, including rationale and what's deliberately out of scope for v1 (automatic restarts, `depends_on`, log persistence, search), is in [doc/000-design.md](doc/000-design.md).
+The full design, including rationale and what's deliberately out of scope for v1 (automatic restarts, log persistence, search), is in [doc/000-design.md](doc/000-design.md).
 
 ## Development
 
