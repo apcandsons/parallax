@@ -67,6 +67,7 @@ Per-process fields:
 | `ready` | none | readiness probe: `{ tcp: host:port }`, `{ http: url }` (2xx), or `{ log: regexp }` (matched against the process's own output) |
 | `ready_timeout` | `60s` | how long the probe may take; on timeout the process is marked failed (red line) and its waiters fail |
 | `wait_for` | none | list of process names; start is delayed until each is ready (a process without `ready` is ready once started) |
+| `stdin` | `true` | give the process a stdin pipe that the TUI types into; `false` attaches `/dev/null` (a program that reads stdin to EOF, like `cat`, will otherwise block) |
 
 Process order in the file determines display order and color assignment, so the layout is stable across runs.
 
@@ -91,15 +92,21 @@ cd examples/demo && parallax
 
 ## Keybindings
 
+With a process selected, whatever you type goes to that process's stdin, so an interactive dev tool works as it would in its own terminal. parallax's own commands then live behind a `ctrl-a` prefix, the way `screen` does it. In the `all` view there is no stdin target, so the commands work without the prefix too.
+
 | key | action |
 |---|---|
-| `0`–`9` | select slot directly (0 is the merged `all` view) |
-| `tab` / `shift-tab`, `←`/`→` | cycle selection |
-| `↑`/`↓`, `pgup`/`pgdn` | scroll; any scroll pauses follow mode |
-| `f` or `end` | resume follow (tail) mode |
-| `r` | restart the selected process |
-| `ctrl-x` | stop the selected process; press again to SIGKILL |
-| `ctrl-c` or `q` | graceful shutdown of everything |
+| `ctrl-a` `0`–`9` | select slot directly (0 is the merged `all` view) |
+| `ctrl-a` `tab` / `shift-tab`, `n` / `p` | cycle selection |
+| `ctrl-a` `r` | restart the selected process |
+| `ctrl-a` `x` (or `ctrl-a` `ctrl-x`) | stop the selected process; press again to SIGKILL |
+| `ctrl-a` `q` (or `ctrl-a` `ctrl-c`) | graceful shutdown of everything |
+| `ctrl-a` `f` | resume follow (tail) mode |
+| `ctrl-a` `a` (or `ctrl-a` `ctrl-a`) | send a literal `ctrl-a` to the process |
+| `ctrl-a` `esc` | cancel the prefix |
+| `↑`/`↓`, `pgup`/`pgdn`, `home`/`end` | scroll; any scroll pauses follow mode (no prefix needed) |
+
+Every other key, including `enter` (sent as `\n`), `ctrl-c`, `ctrl-d`, and pasted text, is written to the selected process. The bottom bar says where keys are going (`keys → iam-api stdin`) and, after `ctrl-a`, lists the commands. Once a shutdown is in progress, a bare `ctrl-c` skips the grace period regardless of the view.
 
 The selector bar shows liveness: running processes render in their assigned color with current memory use (RSS summed over the process group), exited ones in red with the exit code, e.g. `[2-sor ✗1]`. A process parked on `wait_for` shows `⧗`, one running but not yet past its `ready` probe shows `~`, a failed probe `✗ready`, and a waiter whose target never became ready `✗wait`.
 
@@ -108,6 +115,8 @@ The selector bar shows liveness: running processes render in their assigned colo
 Each process runs in its own process group, so stop signals reach the whole tree, including whatever `make` spawns. When a process exits, the others keep running; `r` restarts it. On shutdown, parallax sends each process its stop signal, waits out the grace period while still streaming logs, then SIGKILLs anything left. A second `ctrl-c` skips the wait.
 
 ANSI escape codes in child output are stripped. stderr renders the same as stdout.
+
+Each process's stdin is a pipe, not a terminal, so children see `isatty(0) == false` and don't get raw mode or line editing; keys are delivered byte for byte as they arrive, with `enter` as `\n`. Input to a process that isn't reading is queued and then dropped, with a red line saying so, rather than stalling the TUI. Set `stdin: false` on a process that should read EOF immediately. See [doc/002-stdin.md](doc/002-stdin.md).
 
 The full design, including rationale and what's deliberately out of scope for v1 (automatic restarts, log persistence, search), is in [doc/000-design.md](doc/000-design.md).
 

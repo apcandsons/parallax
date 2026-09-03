@@ -27,6 +27,7 @@ func newManager(t *testing.T, procs ...config.Process) (*Manager, *logbuf.Store)
 		if procs[i].StopTimeout == 0 {
 			procs[i].StopTimeout = 5 * time.Second
 		}
+		procs[i].Stdin = true // config default
 	}
 	cfg := &config.Config{
 		Settings:  config.Settings{ShutdownTimeout: 5 * time.Second, Scrollback: 1000},
@@ -422,4 +423,83 @@ func TestShutdownReleasesWaiters(t *testing.T) {
 	if st := m.Procs[1].Status(); st.Running {
 		t.Errorf("app must not start during shutdown: %+v", st)
 	}
+}
+
+func TestStdinForward(t *testing.T) {
+	m, store := newManager(t, config.Process{
+		Name: "echoer",
+		Run:  `while IFS= read -r line; do echo "got:$line"; done`,
+	})
+	m.StartAll()
+	if !m.Write(0, []byte("hel")) || !m.Write(0, []byte("lo\n")) {
+		t.Fatal("Write to a running process returned false")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !findLine(store.Proc(0), logbuf.Stdout, "got:hello") {
+		if time.Now().After(deadline) {
+			t.Fatal("child never echoed the forwarded input")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Order across separate writes must hold too.
+	m.Write(0, []byte("a"))
+	m.Write(0, []byte("b"))
+	m.Write(0, []byte("c\n"))
+	for !findLine(store.Proc(0), logbuf.Stdout, "got:abc") {
+		if time.Now().After(deadline) {
+			t.Fatal("writes were reordered or lost")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	m.Stop(0)
+	waitExited(t, m, 0)
+	if m.Write(0, []byte("x")) {
+		t.Error("Write to an exited process should return false")
+	}
+}
+
+func TestStdinDisabledGetsEOF(t *testing.T) {
+	m, store := newManager(t, config.Process{
+		Name: "reader",
+		Run:  `cat; echo eof`,
+	})
+	m.Procs[0].Def.Stdin = false
+	m.StartAll()
+	st := waitExited(t, m, 0) // cat sees EOF immediately from /dev/null
+	if st.ExitCode != 0 || !findLine(store.Proc(0), logbuf.Stdout, "eof") {
+		t.Errorf("expected clean exit after eof, got %+v", st)
+	}
+	if m.Write(0, []byte("x")) {
+		t.Error("Write with stdin disabled should return false")
+	}
+}
+
+func TestStdinDropWhenNotRead(t *testing.T) {
+	m, store := newManager(t, config.Process{
+		Name: "deaf",
+		Run:  `exec <&-; sleep 30`, // closes its stdin, never reads
+	})
+	m.StartAll()
+	for i := 0; i < stdinQueue+5; i++ {
+		m.Write(0, []byte("x"))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !findLine(store.Proc(0), logbuf.ErrEvent, "not reading input") {
+		if time.Now().After(deadline) {
+			t.Fatal("expected a drop notice once the queue filled")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	n := 0
+	for _, l := range store.Proc(0) {
+		if strings.Contains(l.Text, "not reading input") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("drop notice logged %d times, want 1", n)
+	}
+	m.ForceKill(0)
+	waitExited(t, m, 0)
 }

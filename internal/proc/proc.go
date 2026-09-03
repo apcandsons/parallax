@@ -53,6 +53,12 @@ type Proc struct {
 	done    chan struct{} // closed when the current run is reaped
 	run     uint64        // incremented per spawn; readiness events for old runs are ignored
 	waitGen uint64        // incremented per wait; cancels a superseded/aborted wait
+
+	// stdin feeds the current run's stdin pipe via a writer goroutine; nil
+	// when not running or when the process has stdin disabled. Writes are
+	// non-blocking so a child that never reads can't stall the UI.
+	stdin        chan []byte
+	stdinDropped bool // input was dropped this run (logged once)
 }
 
 func (p *Proc) Status() Status {
@@ -243,10 +249,17 @@ func (m *Manager) spawn(p *Proc) {
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	var stdin io.WriteCloser
+	var inErr error
+	if p.Def.Stdin {
+		stdin, inErr = cmd.StdinPipe()
+	}
 	stdout, outErr := cmd.StdoutPipe()
 	stderr, errErr := cmd.StderrPipe()
 	var startErr error
-	if outErr != nil {
+	if inErr != nil {
+		startErr = inErr
+	} else if outErr != nil {
 		startErr = outErr
 	} else if errErr != nil {
 		startErr = errErr
@@ -269,11 +282,20 @@ func (m *Manager) spawn(p *Proc) {
 	p.done = done
 	p.run++
 	run := p.run
+	var in chan []byte
+	if stdin != nil {
+		in = make(chan []byte, stdinQueue)
+	}
+	p.stdin = in
+	p.stdinDropped = false
 	p.mu.Unlock()
 	m.changed()
 
 	m.store.Append(p.Index, logbuf.Event, fmt.Sprintf("started (pid %d)", cmd.Process.Pid))
 
+	if in != nil {
+		go writeStdin(stdin, in)
+	}
 	var readers sync.WaitGroup
 	readers.Add(2)
 	go m.readPipe(p, run, stdout, logbuf.Stdout, &readers)
@@ -305,6 +327,10 @@ func (m *Manager) spawn(p *Proc) {
 		st.ReadyFailed = p.st.ReadyFailed
 		p.st = st
 		p.cmd = nil
+		if p.stdin != nil {
+			close(p.stdin)
+			p.stdin = nil
+		}
 		userStopped := p.stopped
 		p.mu.Unlock()
 
@@ -315,6 +341,45 @@ func (m *Manager) spawn(p *Proc) {
 		close(done)
 		m.changed()
 	}()
+}
+
+// stdinQueue bounds how many pending writes a run's stdin can hold before
+// input is dropped. Each entry is one key event (or one paste).
+const stdinQueue = 256
+
+// writeStdin drains in to w in order. It returns on the first write error,
+// which means the child closed its end; the pipe itself is closed by
+// cmd.Wait. Senders keep using the channel until the run is reaped and
+// simply start dropping once it fills.
+func writeStdin(w io.WriteCloser, in <-chan []byte) {
+	for b := range in {
+		if _, err := w.Write(b); err != nil {
+			return
+		}
+	}
+}
+
+// Write queues b for the stdin of process i. It reports false when the
+// process is not running or has stdin disabled. The write never blocks: if
+// the child isn't reading and the queue is full, b is dropped and a single
+// red line says so for this run.
+func (m *Manager) Write(i int, b []byte) bool {
+	p := m.Procs[i]
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stdin == nil {
+		return false
+	}
+	select {
+	case p.stdin <- b:
+	default:
+		if !p.stdinDropped {
+			p.stdinDropped = true
+			// Append takes its own locks and never calls back into p.
+			m.store.Append(i, logbuf.ErrEvent, "stdin: process is not reading input; dropping")
+		}
+	}
+	return true
 }
 
 // markReady records that run passed its probe. Stale runs are ignored.

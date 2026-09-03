@@ -53,6 +53,7 @@ type Model struct {
 	nameWidth  int
 
 	selected      int     // 0 = all, 1..n = process index+1
+	prefix        bool    // ctrl-a pressed; the next key is a parallax command
 	stopping      []bool  // per-process: ctrl-x pressed once for the current run
 	mem           []int64 // per-process RSS bytes; nil until the first sample
 	follow        bool
@@ -148,17 +149,82 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleKey routes a key. In the "all" view every key is a parallax
+// command. With a process selected, keys go to that process's stdin and
+// parallax commands need a ctrl-a prefix (ctrl-a x stops, ctrl-a r
+// restarts, ...). Scroll keys and ctrl-c during shutdown work either way.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := msg.String()
+	if m.prefix {
+		m.prefix = false
+		if s == "esc" {
+			return m, nil
+		}
+		return m.handleCommand(msg)
+	}
+	if s == "ctrl+a" {
+		m.prefix = true
+		return m, nil
+	}
+	if m.shuttingDown && (s == "ctrl+c" || s == "q") {
+		return m.requestStop()
+	}
+	if m.selected == 0 || isScrollKey(s) {
+		return m.handleCommand(msg)
+	}
+	if b := keyBytes(msg); len(b) > 0 {
+		m.mgr.Write(m.selected-1, b)
+	}
+	return m, nil
+}
+
+func isScrollKey(s string) bool {
+	switch s {
+	case "up", "down", "pgup", "pgdown", "home", "end", "ctrl+u", "ctrl+d":
+		return true
+	}
+	return false
+}
+
+// keyBytes is what a terminal would hand a raw-mode program for msg. Enter
+// becomes "\n" (children read a pipe, so the line discipline is ours).
+// Keys with no byte form (arrows, function keys) yield nil.
+func keyBytes(msg tea.KeyMsg) []byte {
+	var b []byte
+	switch {
+	case msg.Type == tea.KeyRunes:
+		b = []byte(string(msg.Runes))
+	case msg.Type == tea.KeySpace:
+		b = []byte(" ")
+	case msg.Type == tea.KeyEnter:
+		b = []byte("\n")
+	case msg.Type >= 0 && msg.Type < 0x80: // control chars: type == byte value
+		b = []byte{byte(msg.Type)}
+	default:
+		return nil
+	}
+	if msg.Alt {
+		b = append([]byte{0x1b}, b...)
+	}
+	return b
+}
+
+func (m Model) handleCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch s := msg.String(); s {
 	case "ctrl+c", "q":
 		return m.requestStop()
 
-	case "tab", "right", "l":
+	case "a", "ctrl+a": // ctrl-a a: send a literal ctrl-a
+		if m.selected > 0 {
+			m.mgr.Write(m.selected-1, []byte{0x01})
+		}
+
+	case "tab", "right", "l", "n":
 		m.selected = (m.selected + 1) % (len(m.cfg.Processes) + 1)
 		m.follow = true
 		m.rebuild()
 
-	case "shift+tab", "left", "h":
+	case "shift+tab", "left", "h", "p":
 		m.selected = (m.selected + len(m.cfg.Processes)) % (len(m.cfg.Processes) + 1)
 		m.follow = true
 		m.rebuild()
@@ -167,14 +233,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.follow = true
 		m.vp.GotoBottom()
 
-	case "r":
+	case "r", "ctrl+r":
 		if m.selected > 0 {
 			i := m.selected - 1
 			m.stopping[i] = false
 			go m.mgr.Restart(i)
 		}
 
-	case "ctrl+x":
+	case "x", "ctrl+x":
 		if m.selected > 0 {
 			i := m.selected - 1
 			if !m.mgr.Procs[i].Status().Running {
@@ -292,7 +358,9 @@ func (m Model) barView() string {
 	}
 	bar := strings.Join(parts, " ")
 
-	if m.shuttingDown {
+	if m.prefix {
+		bar += eventStyle.Render("  ctrl-a  x:stop r:restart q:quit 0-9:select f:follow a:literal ^A")
+	} else if m.shuttingDown {
 		label := "  killing..."
 		if !m.forcing {
 			remain := time.Until(m.deadline)
@@ -304,7 +372,13 @@ func (m Model) barView() string {
 		}
 		bar += errEventStyle.Render(label)
 	} else if i := m.selected - 1; i >= 0 && m.stopping[i] && m.mgr.Procs[i].Status().Running {
-		bar += errEventStyle.Render("  stopping... (ctrl-x again to kill)")
+		bar += errEventStyle.Render("  stopping... (ctrl-a x again to kill)")
+	} else if i >= 0 {
+		hint := "  ctrl-a: commands"
+		if m.cfg.Processes[i].Stdin && m.mgr.Procs[i].Status().Running {
+			hint = "  keys → " + m.cfg.Processes[i].Name + " stdin · ctrl-a: commands"
+		}
+		bar += eventStyle.Render(hint)
 	}
 
 	if m.width > 0 {

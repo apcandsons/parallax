@@ -28,6 +28,7 @@ sor:
   stop_timeout: 1s
   stop_signal: INT
   cwd: sub
+  stdin: false
 `)
 	cfg, err := Load(path, nil)
 	if err != nil {
@@ -52,6 +53,9 @@ sor:
 	}
 	if sor.Cwd != filepath.Join(filepath.Dir(path), "sub") {
 		t.Errorf("cwd = %q, want config-relative sub", sor.Cwd)
+	}
+	if !webui.Stdin || sor.Stdin {
+		t.Errorf("stdin: webui=%v (want default true), sor=%v (want false)", webui.Stdin, sor.Stdin)
 	}
 }
 

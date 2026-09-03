@@ -51,6 +51,7 @@ type Process struct {
 	Ready        *Ready        // nil: ready as soon as started
 	ReadyTimeout time.Duration // how long the probe may take before the process is marked failed
 	WaitFor      []string      // names of processes that must be ready before this one starts
+	Stdin        bool          // give the process a stdin pipe the TUI can type into (default true)
 }
 
 type Config struct {
@@ -74,6 +75,7 @@ type processYAML struct {
 	Ready        *readyYAML        `yaml:"ready"`
 	ReadyTimeout string            `yaml:"ready_timeout"`
 	WaitFor      []string          `yaml:"wait_for"`
+	Stdin        *bool             `yaml:"stdin"`
 }
 
 type readyYAML struct {
@@ -169,6 +171,7 @@ func Load(path string, only []string) (*Config, error) {
 			StopSignal:   syscall.SIGTERM,
 			StopTimeout:  cfg.Settings.ShutdownTimeout,
 			ReadyTimeout: defaultReadyTimeout,
+			Stdin:        r.def.Stdin == nil || *r.def.Stdin,
 		}
 		if r.def.Cwd != "" {
 			if filepath.IsAbs(r.def.Cwd) {
