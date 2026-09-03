@@ -92,21 +92,21 @@ cd examples/demo && parallax
 
 ## Keybindings
 
-With a process selected, whatever you type goes to that process's stdin, so an interactive dev tool works as it would in its own terminal. parallax's own commands then live behind a `ctrl-a` prefix, the way `screen` does it. In the `all` view there is no stdin target, so the commands work without the prefix too.
+Keys are parallax commands. With a process selected, `enter` switches to **input mode**: from then on whatever you type goes to that process's stdin, so an interactive dev tool works as it would in its own terminal. An `INPUT MODE → name` badge sits in the top-right corner of the log pane while it is on. Press `esc` twice within half a second to get back to commands.
 
 | key | action |
 |---|---|
-| `ctrl-a` `0`–`9` | select slot directly (0 is the merged `all` view) |
-| `ctrl-a` `tab` / `shift-tab`, `n` / `p` | cycle selection |
-| `ctrl-a` `r` | restart the selected process |
-| `ctrl-a` `x` (or `ctrl-a` `ctrl-x`) | stop the selected process; press again to SIGKILL |
-| `ctrl-a` `q` (or `ctrl-a` `ctrl-c`) | graceful shutdown of everything |
-| `ctrl-a` `f` | resume follow (tail) mode |
-| `ctrl-a` `a` (or `ctrl-a` `ctrl-a`) | send a literal `ctrl-a` to the process |
-| `ctrl-a` `esc` | cancel the prefix |
-| `↑`/`↓`, `pgup`/`pgdn`, `home`/`end` | scroll; any scroll pauses follow mode (no prefix needed) |
+| `0`–`9` | select slot directly (0 is the merged `all` view) |
+| `tab` / `shift-tab`, `n` / `p`, `←` / `→` | cycle selection |
+| `enter` | input mode: type into the selected process (needs `stdin: true`) |
+| `esc` `esc` | leave input mode (two presses within 0.5s) |
+| `r` | restart the selected process |
+| `x` (or `ctrl-x`) | stop the selected process; press again to SIGKILL |
+| `q` (or `ctrl-c`) | graceful shutdown of everything |
+| `f` | resume follow (tail) mode |
+| `↑`/`↓`, `pgup`/`pgdn`, `home`/`end` | scroll; any scroll pauses follow mode (works in input mode too) |
 
-Every other key, including `enter` (sent as `\n`), `ctrl-c`, `ctrl-d`, and pasted text, is written to the selected process. The bottom bar says where keys are going (`keys → iam-api stdin`) and, after `ctrl-a`, lists the commands. Once a shutdown is in progress, a bare `ctrl-c` skips the grace period regardless of the view.
+In input mode every key with a byte form, including `enter` (sent as `\n`), `ctrl-c`, `ctrl-d`, and pasted text, is written to the selected process. A lone `esc` is held for half a second and then forwarded as `0x1b` if no second `esc` follows; alt-modified keys are forwarded as `ESC`+key straight away. The bottom bar says where keys are going (`keys → iam-api stdin`). Once a shutdown is in progress, a bare `ctrl-c` skips the grace period regardless of mode.
 
 The selector bar shows liveness: running processes render in their assigned color with current memory use (RSS summed over the process group), exited ones in red with the exit code, e.g. `[2-sor ✗1]`. A process parked on `wait_for` shows `⧗`, one running but not yet past its `ready` probe shows `~`, a failed probe `✗ready`, and a waiter whose target never became ready `✗wait`.
 
@@ -116,7 +116,7 @@ Each process runs in its own process group, so stop signals reach the whole tree
 
 ANSI escape codes in child output are stripped. stderr renders the same as stdout.
 
-Each process's stdin is a pipe, not a terminal, so children see `isatty(0) == false` and don't get raw mode or line editing; keys are delivered byte for byte as they arrive, with `enter` as `\n`. Input to a process that isn't reading is queued and then dropped, with a red line saying so, rather than stalling the TUI. Set `stdin: false` on a process that should read EOF immediately. See [doc/002-stdin.md](doc/002-stdin.md).
+Each process's stdin is a pipe, not a terminal, so children see `isatty(0) == false` and don't get raw mode or line editing; in input mode keys are delivered byte for byte as they arrive, with `enter` as `\n`. Input to a process that isn't reading is queued and then dropped, with a red line saying so, rather than stalling the TUI. Set `stdin: false` on a process that should read EOF immediately. See [doc/002-stdin.md](doc/002-stdin.md).
 
 The full design, including rationale and what's deliberately out of scope for v1 (automatic restarts, log persistence, search), is in [doc/000-design.md](doc/000-design.md).
 
