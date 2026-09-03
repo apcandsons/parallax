@@ -66,15 +66,18 @@ The selector shows liveness: a running process renders its label in its assigned
 
 ### Keybindings
 
+Keys typed while a process is selected go to that process's stdin; parallax commands sit behind a `ctrl-a` prefix. In the `all` view the prefix is optional. See `002-stdin.md`.
+
 | key | action |
 |---|---|
-| `0`–`9` | select slot directly |
-| `tab` / `shift-tab`, `←`/`→` | cycle selection |
-| `↑`/`↓`, `pgup`/`pgdn` | scroll; any scroll pauses follow mode |
-| `f` or `end` | resume follow (tail) mode |
-| `r` | restart the selected process |
-| `ctrl-x` | stop the selected process (its stop signal); press again to SIGKILL |
-| `ctrl-c` | graceful shutdown of everything |
+| `ctrl-a` `0`–`9` | select slot directly |
+| `ctrl-a` `tab` / `shift-tab`, `n` / `p` | cycle selection |
+| `↑`/`↓`, `pgup`/`pgdn`, `home`/`end` | scroll; any scroll pauses follow mode |
+| `ctrl-a` `f` | resume follow (tail) mode |
+| `ctrl-a` `r` | restart the selected process |
+| `ctrl-a` `x` | stop the selected process (its stop signal); press again to SIGKILL |
+| `ctrl-a` `q` / `ctrl-a` `ctrl-c` | graceful shutdown of everything |
+| `ctrl-a` `a` | send a literal ctrl-a |
 
 ## Log format
 
@@ -110,7 +113,7 @@ When a process exits, parallax logs the red exit line and marks the slot. Other 
 
 ### Shutdown
 
-`ctrl-c` (or `q`) starts the shutdown sequence:
+`ctrl-a q` (or `ctrl-a ctrl-c`; bare `q`/`ctrl-c` in the `all` view) starts the shutdown sequence:
 
 1. Send `stop_signal` (default SIGTERM) to every process group.
 2. Wait up to `shutdown_timeout` (default 10s, configurable globally and per process).
@@ -138,4 +141,4 @@ Internal structure:
 - ~~Dependency ordering between processes (`depends_on`)~~ — superseded by readiness-gated `wait_for`, see `001-readiness.md`
 - Log persistence to disk
 - Search within the log pane
-- Attaching stdin to a child process
+- ~~Attaching stdin to a child process~~ — done, see `002-stdin.md`
