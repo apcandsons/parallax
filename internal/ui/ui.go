@@ -28,11 +28,19 @@ type shutdownDoneMsg struct{}
 type tickMsg time.Time
 type memMsg []int64 // per-process RSS bytes, from proc.Manager.RSS
 
+// escTimeoutMsg fires escDelay after a lone esc in input mode. If no second
+// esc arrived by then, the held esc is forwarded to the process.
+type escTimeoutMsg struct{ seq uint64 }
+
+// escDelay is the window for the esc-esc chord that leaves input mode.
+const escDelay = 500 * time.Millisecond
+
 var (
 	tsStyle       = lipgloss.NewStyle().Faint(true)
 	eventStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // gray
 	errEventStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // red
 	okMarkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	modeStyle     = lipgloss.NewStyle().Reverse(true).Bold(true).Foreground(lipgloss.Color("3"))
 )
 
 // palette cycles by config order: cyan, green, magenta, yellow, blue, ...
@@ -53,7 +61,9 @@ type Model struct {
 	nameWidth  int
 
 	selected      int     // 0 = all, 1..n = process index+1
-	prefix        bool    // ctrl-a pressed; the next key is a parallax command
+	input         bool    // input mode: keys go to the selected process's stdin
+	escPending    bool    // a lone esc is held, waiting for a second one
+	escSeq        uint64  // identifies the timeout for the currently held esc
 	stopping      []bool  // per-process: ctrl-x pressed once for the current run
 	mem           []int64 // per-process RSS bytes; nil until the first sample
 	follow        bool
@@ -143,34 +153,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mem = msg
 		return m, sampleMem(m.mgr, 2*time.Second)
 
+	case escTimeoutMsg:
+		if m.escPending && msg.seq == m.escSeq {
+			m.flushEsc()
+		}
+		return m, nil
+
 	case shutdownDoneMsg:
 		return m, tea.Quit
 	}
 	return m, nil
 }
 
-// handleKey routes a key. In the "all" view every key is a parallax
-// command. With a process selected, keys go to that process's stdin and
-// parallax commands need a ctrl-a prefix (ctrl-a x stops, ctrl-a r
-// restarts, ...). Scroll keys and ctrl-c during shutdown work either way.
+// handleKey routes a key. Keys are parallax commands unless input mode is
+// on, which enter turns on with a process selected: from then on keys go
+// to that process's stdin until esc is pressed twice within escDelay.
+// Scroll keys and ctrl-c during shutdown work either way.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	s := msg.String()
-	if m.prefix {
-		m.prefix = false
-		if s == "esc" {
-			return m, nil
-		}
-		return m.handleCommand(msg)
-	}
-	if s == "ctrl+a" {
-		m.prefix = true
-		return m, nil
-	}
 	if m.shuttingDown && (s == "ctrl+c" || s == "q") {
 		return m.requestStop()
 	}
-	if m.selected == 0 || isScrollKey(s) {
+	if !m.input {
+		if s == "enter" {
+			return m.enterInput()
+		}
 		return m.handleCommand(msg)
+	}
+	if isScrollKey(s) {
+		return m.handleCommand(msg)
+	}
+	if s == "esc" && !msg.Alt {
+		if m.escPending {
+			// esc esc: leave input mode; neither esc reaches the process.
+			m.escPending = false
+			m.input = false
+			return m, nil
+		}
+		m.escPending = true
+		m.escSeq++
+		seq := m.escSeq
+		return m, tea.Tick(escDelay, func(time.Time) tea.Msg { return escTimeoutMsg{seq} })
+	}
+	if m.escPending {
+		m.flushEsc() // keep byte order: the held esc goes first
 	}
 	if b := keyBytes(msg); len(b) > 0 {
 		m.mgr.Write(m.selected-1, b)
@@ -178,9 +204,28 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// enterInput switches to input mode for the selected process. It is a
+// no-op in the all view and for a process with stdin disabled.
+func (m Model) enterInput() (tea.Model, tea.Cmd) {
+	if i := m.selected - 1; i >= 0 && m.cfg.Processes[i].Stdin {
+		m.input = true
+		m.escPending = false
+	}
+	return m, nil
+}
+
+// flushEsc forwards the held esc to the selected process.
+func (m *Model) flushEsc() {
+	m.escPending = false
+	m.mgr.Write(m.selected-1, []byte{0x1b})
+}
+
+// isScrollKey lists the keys that keep scrolling the pane in input mode.
+// They have no byte form for a pipe anyway. ctrl-u/ctrl-d are not here:
+// in input mode they belong to the process (ctrl-d is EOF).
 func isScrollKey(s string) bool {
 	switch s {
-	case "up", "down", "pgup", "pgdown", "home", "end", "ctrl+u", "ctrl+d":
+	case "up", "down", "pgup", "pgdown", "home", "end":
 		return true
 	}
 	return false
@@ -213,11 +258,6 @@ func (m Model) handleCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch s := msg.String(); s {
 	case "ctrl+c", "q":
 		return m.requestStop()
-
-	case "a", "ctrl+a": // ctrl-a a: send a literal ctrl-a
-		if m.selected > 0 {
-			m.mgr.Write(m.selected-1, []byte{0x01})
-		}
 
 	case "tab", "right", "l", "n":
 		m.selected = (m.selected + 1) % (len(m.cfg.Processes) + 1)
@@ -346,7 +386,40 @@ func (m Model) View() string {
 	if !m.ready {
 		return "starting..."
 	}
-	return m.vp.View() + "\n" + m.barView()
+	return m.paneView() + "\n" + m.barView()
+}
+
+// paneView is the log viewport with the input-mode badge overlaid on the
+// right end of its top line.
+func (m Model) paneView() string {
+	view := m.vp.View()
+	if !m.input {
+		return view
+	}
+	badge := m.modeBadge()
+	bw := lipgloss.Width(badge)
+	if bw+1 > m.width {
+		return view
+	}
+	first, rest, hasRest := strings.Cut(view, "\n")
+	first = truncate.String(first, uint(m.width-bw-1))
+	if pad := m.width - bw - lipgloss.Width(first); pad > 0 {
+		first += strings.Repeat(" ", pad)
+	}
+	first += badge
+	if hasRest {
+		return first + "\n" + rest
+	}
+	return first
+}
+
+func (m Model) modeBadge() string {
+	name := m.cfg.Processes[m.selected-1].Name
+	label := " INPUT MODE → " + name + " · esc esc to leave "
+	if m.escPending {
+		label = " INPUT MODE → " + name + " · esc again to leave "
+	}
+	return modeStyle.Render(label)
 }
 
 func (m Model) barView() string {
@@ -358,9 +431,7 @@ func (m Model) barView() string {
 	}
 	bar := strings.Join(parts, " ")
 
-	if m.prefix {
-		bar += eventStyle.Render("  ctrl-a  x:stop r:restart q:quit 0-9:select f:follow a:literal ^A")
-	} else if m.shuttingDown {
+	if m.shuttingDown {
 		label := "  killing..."
 		if !m.forcing {
 			remain := time.Until(m.deadline)
@@ -372,13 +443,11 @@ func (m Model) barView() string {
 		}
 		bar += errEventStyle.Render(label)
 	} else if i := m.selected - 1; i >= 0 && m.stopping[i] && m.mgr.Procs[i].Status().Running {
-		bar += errEventStyle.Render("  stopping... (ctrl-a x again to kill)")
-	} else if i >= 0 {
-		hint := "  ctrl-a: commands"
-		if m.cfg.Processes[i].Stdin && m.mgr.Procs[i].Status().Running {
-			hint = "  keys → " + m.cfg.Processes[i].Name + " stdin · ctrl-a: commands"
-		}
-		bar += eventStyle.Render(hint)
+		bar += errEventStyle.Render("  stopping... (x again to kill)")
+	} else if m.input {
+		bar += eventStyle.Render("  keys → " + m.cfg.Processes[i].Name + " stdin · esc esc: commands")
+	} else if i >= 0 && m.cfg.Processes[i].Stdin {
+		bar += eventStyle.Render("  enter: type into " + m.cfg.Processes[i].Name)
 	}
 
 	if m.width > 0 {
